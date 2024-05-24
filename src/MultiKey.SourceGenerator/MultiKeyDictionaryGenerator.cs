@@ -867,7 +867,7 @@ private static string Template4(string key1Type,
                  Selector1 = (Func<{{itemType}}, {{key1Type}}>)({{selector1}});
                  Selector2 = (Func<{{itemType}}, {{key2Type}}>)({{selector2}});
                  Selector3 = (Func<{{itemType}}, {{key3Type}}>)({{selector3}});
-                 Selector4 = (Func<{{itemType}}, {{key3Type}}>)({{selector4}});
+                 Selector4 = (Func<{{itemType}}, {{key4Type}}>)({{selector4}});
              }
           
              private static readonly Func<{{itemType}}, {{key1Type}}> Selector1;
@@ -898,7 +898,7 @@ private static string Template4(string key1Type,
                       .GroupBy(item => Selector3(item.item!))
                       .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
              
-             private ImmutableDictionary<{{key3Type}}, ImmutableHashSet<int>> Index4 =>
+             private ImmutableDictionary<{{key4Type}}, ImmutableHashSet<int>> Index4 =>
                 _index4 ??= _items
                        .Select((item, index) => (item, index))
                        .Where(i => i.item != null)
