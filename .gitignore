@@ -6,10 +6,10 @@ obj/
 *.user
 *.suo
 *.userosscache
-*.sln.docstates
+
 
 # Ignore IDE-specific files
 .vscode/
 .idea/
-*.sln.docstates
+
 *.DotSettings

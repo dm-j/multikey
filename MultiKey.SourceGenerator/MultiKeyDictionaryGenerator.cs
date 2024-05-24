@@ -1,12 +1,8 @@
-﻿using System.Collections.Generic;
-using System.Collections.Immutable;
-using System.Linq;
+﻿using System.Collections.Immutable;
 using System.Text;
-using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Formatting;
 using Microsoft.CodeAnalysis.Text;
 
 namespace MultiKey.SourceGenerator;
@@ -16,23 +12,19 @@ public class MultiKeyDictionaryGenerator : IIncrementalGenerator
 {
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        // Register a syntax receiver that will be created for each generation pass
-        context.RegisterPostInitializationOutput(RegisterAttributeSource);
-
-        var classDeclarations = context.SyntaxProvider
-            .CreateSyntaxProvider(IsSyntaxTargetForGeneration, TransformSyntaxToClass)
-            .Where(static m => m is not null);
-
+        IncrementalValuesProvider<RecordDeclarationSyntax> recordDeclarations = context.SyntaxProvider
+            .CreateSyntaxProvider(
+                predicate: (s, _) => _isSyntaxTargetForGeneration(s),
+                transform: (ctx, _) => _getSemanticTargetForGeneration(ctx))
+            .Where(m => m is not null)!;
         
-        //Debugger.Launch();
-        var compilationAndClasses = context.CompilationProvider.Combine(classDeclarations.Collect());
-
-        context.RegisterSourceOutput(compilationAndClasses, (spc, source) =>
-        {
-            GenerateAndAddSource(spc, source.Left, source.Right!);
-        });
+        IncrementalValueProvider<(Compilation, ImmutableArray<RecordDeclarationSyntax>)> compilationAndRecords
+            = context.CompilationProvider.Combine(recordDeclarations.Collect());
+        context.RegisterPostInitializationOutput(RegisterAttributeSource);
+        context.RegisterSourceOutput(compilationAndRecords,
+            static (spc, source) => _execute(source.Item1, source.Item2, spc));
     }
-
+    
     private void RegisterAttributeSource(IncrementalGeneratorPostInitializationContext context)
     {
         var attributeSource = @"
@@ -48,472 +40,1157 @@ using System;
 namespace MultiKey
 {
     [AttributeUsage(AttributeTargets.Class)]
-    internal sealed class MultiKeyDictionaryAttribute<TPrimary, TSecondary, TItem> : Attribute
+    internal sealed class MultiKeyDictionaryAttribute<TKey, TKey2, TItem> : Attribute
     {
-        public MultiKeyDictionaryAttribute(string primarySelector, string secondarySelector)
+        public MultiKeyDictionaryAttribute(string selector1, string selector2)
         {
-            PrimarySelector = primarySelector;
-            SecondarySelector = secondarySelector;
+            Selector1 = selector1;
+            Selector2 = selector2;
         }
 
-        public string PrimarySelector { get; }
-        public string SecondarySelector { get; }
+        public string Selector1 { get; }
+        public string Selector2 { get; }
+    }
+
+    [AttributeUsage(AttributeTargets.Class)]
+    internal sealed class MultiKeyDictionaryAttribute<TKey, TKey2, TKey3, TItem> : Attribute
+    {
+        public MultiKeyDictionaryAttribute(string selector1, string selector2, string selector3)
+        {
+            Selector1 = selector1;
+            Selector2 = selector2;
+            Selector3 = selector3;
+        }
+
+        public string Selector1 { get; }
+        public string Selector2 { get; }
+        public string Selector3 { get; }
+    }
+
+    [AttributeUsage(AttributeTargets.Class)]
+    internal sealed class MultiKeyDictionaryAttribute<TKey, TKey2, TKey3, TKey4, TItem> : Attribute
+    {
+        public MultiKeyDictionaryAttribute(string selector1, string selector2, string selector3, string selector4)
+        {
+            Selector1 = selector1;
+            Selector2 = selector2;
+            Selector3 = selector3;
+            Selector4 = selector4;
+        }
+
+        public string Selector1 { get; }
+        public string Selector2 { get; }
+        public string Selector3 { get; }
+        public string Selector4 { get; } 
     }
 }
 ";
         context.AddSource("MultiKeyDictionaryAttribute.g.cs", attributeSource);
     }
-
-    private static bool IsSyntaxTargetForGeneration(SyntaxNode node, CancellationToken cancellationToken)
+    
+    static bool _isSyntaxTargetForGeneration(SyntaxNode node) => 
+        node is RecordDeclarationSyntax { AttributeLists.Count: > 0 };
+    
+    private static RecordDeclarationSyntax? _getSemanticTargetForGeneration(GeneratorSyntaxContext context)
     {
-        return node is RecordDeclarationSyntax recordDeclaration && recordDeclaration.AttributeLists.Count > 0;
-    }
+        var recordDeclarationSyntax = (RecordDeclarationSyntax)context.Node;
 
-    private static RecordDeclarationSyntax? TransformSyntaxToClass(GeneratorSyntaxContext context, CancellationToken cancellationToken)
-    {
-        var recordDeclaration = (RecordDeclarationSyntax)context.Node;
-
-        foreach (var attributeList in recordDeclaration.AttributeLists)
+        foreach (AttributeListSyntax attributeListSyntax in recordDeclarationSyntax.AttributeLists)
         {
-            foreach (var attribute in attributeList.Attributes)
+            foreach (AttributeSyntax attributeSyntax in attributeListSyntax.Attributes)
             {
-                if (ModelExtensions.GetSymbolInfo(context.SemanticModel, attribute).Symbol is not IMethodSymbol attributeSymbol)
-                    continue;
-                
-                if (attributeSymbol.ContainingType.ToDisplayString().StartsWith("MultiKey.MultiKeyDictionaryAttribute<"))
+                if (ModelExtensions.GetSymbolInfo(context.SemanticModel, attributeSyntax).Symbol is not IMethodSymbol attributeSymbol)
                 {
-                    return recordDeclaration;
+                    continue;
+                }
+
+                INamedTypeSymbol attributeContainingTypeSymbol = attributeSymbol.ContainingType;
+                string fullName = attributeContainingTypeSymbol.ToDisplayString();
+
+                if (fullName.StartsWith("MultiKey.MultiKeyDictionary"))
+                {
+                    return recordDeclarationSyntax;
                 }
             }
         }
 
         return null;
     }
-
-    private void GenerateAndAddSource(SourceProductionContext context, Compilation compilation, ImmutableArray<RecordDeclarationSyntax> recordDeclarations)
+    
+    static void _execute(Compilation compilation, ImmutableArray<RecordDeclarationSyntax> records, SourceProductionContext context)
     {
-        foreach (var recordDeclaration in recordDeclarations)
+        if (records.IsDefaultOrEmpty || context.CancellationToken.IsCancellationRequested)
         {
-            var semanticModel = compilation.GetSemanticModel(recordDeclaration.SyntaxTree);
+            return;
+        }
         
+        IEnumerable<RecordDeclarationSyntax> distinctRecords = records.Distinct();
+
+        var recordsToGenerate = _generateRecords(compilation, distinctRecords, context, context.CancellationToken);
+
+        foreach (var (fileName, content) in recordsToGenerate)
+        {
+            if (context.CancellationToken.IsCancellationRequested) break;
+            
+            context.AddSource($"{fileName}.generated.cs", SourceText.From(content, Encoding.UTF8));
+        }
+    }
+    
+    private static IEnumerable<(string fileName, string content)> _generateRecords(Compilation compilation, IEnumerable<RecordDeclarationSyntax> distinctRecords, SourceProductionContext _1, CancellationToken cancellationToken)
+    {
+        var recordDeclarationSyntax = distinctRecords.ToArray();
+        for (int i = 0; i < recordDeclarationSyntax.Length && !cancellationToken.IsCancellationRequested; i++)
+        {
+            var semanticModel = compilation.GetSemanticModel(recordDeclarationSyntax[i].SyntaxTree);
+
             // Get the symbol representing the class
-            var classSymbol = ModelExtensions.GetDeclaredSymbol(semanticModel, recordDeclaration) as INamedTypeSymbol;
+            var classSymbol = ModelExtensions.GetDeclaredSymbol(semanticModel, recordDeclarationSyntax[i]) as INamedTypeSymbol;
 
             if (classSymbol is null)
                 continue;
 
             // Extract attribute information
             var multiKeyAttribute = classSymbol.GetAttributes()
-                .FirstOrDefault(attr => attr.AttributeClass!.ToDisplayString().StartsWith("MultiKey.MultiKeyDictionaryAttribute<"));
+                .FirstOrDefault(attr =>
+                    attr.AttributeClass!.ToDisplayString().StartsWith("MultiKey.MultiKeyDictionaryAttribute<"));
 
             if (multiKeyAttribute == null) continue;
 
-            var primaryType = multiKeyAttribute.AttributeClass!.TypeArguments[0];
-            var secondaryType = multiKeyAttribute.AttributeClass.TypeArguments[1];
-            var itemType = multiKeyAttribute.AttributeClass.TypeArguments[2];
-            string primarySelector = (string)multiKeyAttribute.ConstructorArguments[0].Value!;
-            string secondarySelector = (string)multiKeyAttribute.ConstructorArguments[1].Value!;
-
-            // Collect namespaces and enclosing declarations
-            var (outerNamespace, namespaces, enclosingDeclarations) = NamespaceCollector.CollectNamespacesAndEnclosingDeclarations(recordDeclaration, semanticModel);
-
-            // Generate the source code
-            var sourceCode = Template(classSymbol, primaryType, secondaryType, itemType, primarySelector, secondarySelector, namespaces, enclosingDeclarations, outerNamespace);
-
-            var formattedSourceCode = FormatSourceCode(sourceCode);
+            int numberOfTypes = multiKeyAttribute.AttributeClass!.TypeArguments.Length;
             
-            // Add the generated source to the compilation
-            context.AddSource($"{classSymbol.Name}.g.cs", SourceText.From(formattedSourceCode, Encoding.UTF8));
-        }
-    }
-    
-    private string FormatSourceCode(string sourceCode)
-    {
-        var tree = CSharpSyntaxTree.ParseText(sourceCode);
-        var root = tree.GetRoot();
-
-        var workspace = new AdhocWorkspace();
-        var options = workspace.Options;
-
-        options = options.WithChangedOption(FormattingOptions.NewLine, LanguageNames.CSharp, "\n");
-        options = options.WithChangedOption(FormattingOptions.UseTabs, LanguageNames.CSharp, false);
-        options = options.WithChangedOption(FormattingOptions.TabSize, LanguageNames.CSharp, 4);
-        options = options.WithChangedOption(FormattingOptions.IndentationSize, LanguageNames.CSharp, 4);
-
-        var formattedRoot = Formatter.Format(root, workspace, options);
-        return formattedRoot.ToFullString();
-    }
-
-    private string Template(
-        INamedTypeSymbol partialMultiKeyDictionary,
-        ITypeSymbol primary,
-        ITypeSymbol secondary,
-        ITypeSymbol item,
-        string primarySelector, 
-        string secondarySelector, 
-        HashSet<string> namespaces, 
-        List<string> enclosingDeclarations, 
-        string partialMultiKeyDictionaryNamespace)
-    {
-        string primaryType = primary.Name!;
-        string secondaryType = secondary.Name!;
-        string itemType = item.Name!;
-        string dictName = partialMultiKeyDictionary.Name;
-
-        // Combine with default namespaces and remove duplicates
-        var defaultNamespaces = new HashSet<string> { 
-            "System",
-            "System.Collections",
-            "System.Collections.Generic",
-            "System.Collections.Immutable",
-            "System.Text.Json",
-            "SJson = System.Text.Json.Serialization"
-        };
-        namespaces.UnionWith(defaultNamespaces);
-
-        var sortedNamespaces = namespaces.OrderBy(ns => ns).ToList();
-
-        var namespaceLines = sortedNamespaces.Select(ns => $"using {ns};");
-
-        var top = $$"""
-            // <auto-generated>
-            // This code was generated by a tool.
-            //
-            // Changes to this file may cause incorrect behavior and will be lost if
-            // the code is regenerated.
-            // </auto-generated>
-
-            // This class serializes/deserializes to Json via System.Text.Json
-            // To enable Newtonsoft.Json, define the following constant in your project: MULTIKEY_USE_NEWTONSOFT_JSON
+            var key1Type = multiKeyAttribute.AttributeClass!.TypeArguments[0].Name;
+            var key2Type = multiKeyAttribute.AttributeClass.TypeArguments[1].Name;
+            string itemType;
+            string selector1 = (string)multiKeyAttribute.ConstructorArguments[0].Value!;
+            string selector2 = (string)multiKeyAttribute.ConstructorArguments[1].Value!;
+            string dictName = classSymbol.Name;
             
-            #nullable enable
+            string nameSpace = SyntaxNodeHelper.GetNamespace(recordDeclarationSyntax[i], cancellationToken);
             
-            {{string.Join("\n", namespaceLines)}}
-            #if MULTIKEY_USE_NEWTONSOFT_JSON
-            using NJson = Newtonsoft.Json;
-            #endif
-            
-            """;
-
-        var @class = $$"""
-            namespace {{partialMultiKeyDictionaryNamespace}}
+            var namespaces = new HashSet<string>
             {
-                /// <summary>
-                /// Represents a specialized immutable dictionary of {{itemType}}.
-                /// </summary>
-                /// <remarks>
-                /// The <see cref="{{dictName}}"/> class provides efficient lookup capabilities 
-                /// for items using both primary and secondary keys. The primary key allows for direct access to individual items,
-                /// while the secondary key allows for grouped access to items sharing the same secondary key.
-                /// </remarks>
-                /// <example>
-                /// The following example demonstrates how to use the <see cref="{{dictName}}"/>:
-                /// <code>
-                /// {{dictName}} dictionary = new {{dictName}}();
-                /// {{primaryType}} primaryKey = /* any {{primaryType}} value */ default;
-                /// {{secondaryType}} secondaryKey = /* any {{secondaryType}} value */ default;
-                /// {{itemType}} byPrimary = dictionary[primaryKey]; // Returns 1 item or throws exception
-                /// IReadOnlyList<{{itemType}}> bySecondary = dictionary[secondaryKey]; // Returns 0+ items
-                /// </code>
-                /// </example>
-            #if MULTIKEY_USE_NEWTONSOFT_JSON
-            [NJson.JsonConverter(typeof({{dictName}}NewtonsoftConverter))]
-            #endif
-                [SJson.JsonConverter(typeof({{dictName}}SystemConverter))]
-                public sealed partial record {{dictName}} : IReadOnlyDictionary<{{primaryType}}, {{itemType}}>
-                {
-                    private readonly ImmutableList<{{itemType}}?> _items;
+                "System",
+                "System.Collections",
+                "System.Collections.Generic",
+                "System.Collections.Immutable",
+            };
             
-                    private ImmutableDictionary<{{primaryType}}, int>? _primaryIndex; // Will be initialized lazily
-            
-                    private ImmutableDictionary<{{secondaryType}}, ImmutableHashSet<int>>? _secondaryIndex; // Will be initialized lazily
-            
-                    static {{dictName}}()
-                    {
-                        // These two assignments will be filled in by source generation, supplied by user
-                        PrimarySelector = (Func<{{itemType}}, {{primaryType}}>)({{primarySelector}});
-                        SecondarySelector = (Func<{{itemType}}, {{secondaryType}}>)({{secondarySelector}});
-                    }
-            
-                    private static readonly Func<{{itemType}}, {{primaryType}}> PrimarySelector;
-            
-                    private static readonly Func<{{itemType}}, {{secondaryType}}> SecondarySelector;
-            
-                    private ImmutableDictionary<{{primaryType}}, int> PrimaryIndex =>
-                        _primaryIndex ??= _items
-                            .Select((item, index) => (item, index))
-                            .Where(i => i.item is not null)
-                            .ToImmutableDictionary(key => PrimarySelector(key.item!), value => value.index);
-            
-                    private ImmutableDictionary<{{secondaryType}}, ImmutableHashSet<int>> SecondaryIndex =>
-                        _secondaryIndex ??= _items
-                            .Select((item, index) => (item, index))
-                            .Where(i => i.item != null)
-                            .GroupBy(item => SecondarySelector(item.item!))
-                            .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
-            
-                    public {{dictName}}()
-                    {
-                        _items = new List<{{itemType}}?>().ToImmutableList();
-                    }
-            
-                    public {{dictName}}(IEnumerable<{{itemType}}> items)
-                    {
-                        _items = items.ToImmutableList()!;
-                    }
-            
-                    public {{itemType}} this[{{primaryType}} primary] => _items[PrimaryIndex[primary]]!;
-            
-                    public IEnumerable<{{primaryType}}> Keys => PrimaryIndex.Keys;
-                    public IEnumerable<{{secondaryType}}> KeysSecondary => SecondaryIndex.Keys;
-                    public IEnumerable<{{itemType}}> Values => _items.Where(i => i is not null)!;
-            
-                    public IReadOnlyList<{{itemType}}> this[{{secondaryType}} secondary] =>
-                        SecondaryIndex.TryGetValue(secondary, out var result)
-                            ? result.Select(i => _items[i]!).ToList().AsReadOnly()
-                            : ((List<{{itemType}}>) []).AsReadOnly();
-            
-                    public bool ContainsKey({{primaryType}} key) =>
-                        PrimaryIndex.ContainsKey(key);
-            
-                    public bool ContainsKeySecondary({{secondaryType}} key) =>
-                        SecondaryIndex.ContainsKey(key);
-            
-                    public bool TryGetValue({{primaryType}} primaryKey, out {{itemType}} item)
-                    {
-                        if (PrimaryIndex.TryGetValue(primaryKey, out var index))
-                        {
-                            item = _items[index]!;
-                            return true;
-                        }
-            
-                        item = default!;
-                        return false;
-                    }
-            
-                    public bool TryGetValue({{secondaryType}} secondaryKey, out IReadOnlyList<{{itemType}}> items)
-                    {
-                        if (SecondaryIndex.TryGetValue(secondaryKey, out var indexes))
-                        {
-                            items = indexes.Select(i => _items[i]!).ToList().AsReadOnly();
-                            return true;
-                        }
-            
-                        items = default!;
-                        return false;
-                    }
-            
-                    public {{dictName}} Add({{itemType}} item)
-                    {
-                        var primaryKey = PrimarySelector(item);
-            
-                        if (PrimaryIndex.ContainsKey(primaryKey))
-                            throw new ArgumentException("An item with the same primary key already exists in the dictionary.",
-                                nameof(_primaryIndex));
-            
-                        return new(_items.Add(item)!);
-                    }
-            
-                    public {{dictName}} Remove({{primaryType}} primary)
-                    {
-                        if (!PrimaryIndex.TryGetValue(primary, out var index))
-                            return this;
-            
-                        return new(_items.Remove(_items[index])!);
-                    }
-            
-                    public {{dictName}} Remove({{itemType}} item) =>
-                        new(_items.Remove(item)!);
-            
-                    public {{dictName}} SetItem({{itemType}} item)
-                    {
-                        var primaryKey = PrimarySelector(item);
-            
-                        if (!PrimaryIndex.TryGetValue(primaryKey, out var index))
-                        {
-                            return Add(item);
-                        }
-            
-                        return new(_items.SetItem(index, item)!);
-                    }
-            
-                    public {{dictName}} Compact() =>
-                        new(_items.Where(item => item is not null)!);
-            
-            #if MULTIKEY_USE_NEWTONSOFT_JSON
-                public class {{dictName}}NewtonsoftConverter : NJson.JsonConverter
-                {
-                    public override bool CanConvert(Type objectType) => objectType == typeof({{dictName}});
-            
-                    public override void WriteJson(NJson.JsonWriter writer, object value, NJson.JsonSerializer serializer)
-                    {
-                        var dictionary = value as {{dictName}};
-                        if (dictionary is null)
-                        {
-                            writer.WriteNull();
-                            return;
-                        }
-            
-                        serializer.Serialize(writer, dictionary.Values);
-                    }
-            
-                    public override object ReadJson(NJson.JsonReader reader, Type objectType, object existingValue, NJson.JsonSerializer serializer)
-                    {
-                        if (reader.TokenType == NJson.JsonToken.Null)
-                            return null;
-            
-                        var items = serializer.Deserialize<List<{{itemType}}>>(reader);
-                        if (items is null)
-                            return null;
-            
-                        return new {{dictName}}(items);
-                    }
-                }
-            #endif
-            
-                    public class {{dictName}}SystemConverter : SJson.JsonConverter<{{dictName}}>
-                    {
-                        public override {{dictName}} Read(ref Utf8JsonReader reader, Type typeToConvert,
-                            JsonSerializerOptions options)
-                        {
-                            if (reader.TokenType != JsonTokenType.StartArray)
-                            {
-                                throw new JsonException("Invalid {{dictName}} serialization");
-                            }
-            
-                            List<{{itemType}}> primary = new();
-            
-                            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                            {
-                                var item = JsonSerializer.Deserialize<{{itemType}}>(ref reader, options);
-                                primary.Add(item!);
-                            }
-            
-                            return new {{dictName}}(primary);
-                        }
-            
-                        public override void Write(Utf8JsonWriter writer, {{dictName}} value, JsonSerializerOptions options)
-                        {
-                            writer.WriteStartArray();
-            
-                            foreach (var item in value.Values)
-                            {
-                                JsonSerializer.Serialize(writer, item, options);
-                            }
-            
-                            writer.WriteEndArray();
-                        }
-                    }
-            
-                    public int Count => PrimaryIndex.Count;
-            
-                    IEnumerator<KeyValuePair<{{primaryType}}, {{itemType}}>> IEnumerable<KeyValuePair<{{primaryType}}, {{itemType}}>>.GetEnumerator()
-                    {
-                        return PrimaryIndex
-                            .Select(kvp => new KeyValuePair<{{primaryType}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
-                            .GetEnumerator();
-                    }
-            
-                    public IEnumerator GetEnumerator()
-                    {
-                        return PrimaryIndex.GetEnumerator();
-                    }
-                }
-                
-                public static class {{dictName}}Extensions
-                {
-                    public static {{dictName}} To{{dictName}}(this IEnumerable<{{itemType}}> sequence)
-                    {
-                        return new(sequence);
-                    }
-                }
-            """;
+            var symbols = recordDeclarationSyntax[i].DescendantNodes()
+                .OfType<IdentifierNameSyntax>()
+                .Select(identifier => ModelExtensions.GetSymbolInfo(semanticModel, identifier).Symbol)
+                .Where(symbol => symbol is not null)
+                .Distinct(SymbolEqualityComparer.Default);
 
-        var bottom = new StringBuilder();
-        foreach (var decl in enclosingDeclarations)
-        {
-            bottom.AppendLine("}");
-        }
-
-        return top + @class + bottom + "\n #nullable restore";
-    }
-
-    // Helper class to find candidate classes for code generation
-    private class SyntaxReceiver : ISyntaxReceiver
-    {
-        public List<ClassDeclarationSyntax> CandidateClasses { get; } = new List<ClassDeclarationSyntax>();
-
-        public void OnVisitSyntaxNode(SyntaxNode syntaxNode)
-        {
-            if (syntaxNode is ClassDeclarationSyntax { AttributeLists.Count: > 0 } classDeclarationSyntax)
+            foreach (var symbol in symbols)
             {
-                CandidateClasses.Add(classDeclarationSyntax);
+                if (symbol!.ContainingNamespace != null && !symbol.ContainingNamespace.IsGlobalNamespace)
+                {
+                    namespaces.Add(symbol.ContainingNamespace.ToDisplayString());
+                }
             }
+            
+            var parents = SyntaxNodeHelper
+                .GetParentClasses(recordDeclarationSyntax[i], cancellationToken)
+                .ToList();
+
+            IEnumerable<StringBuilder> s;
+            
+            switch (numberOfTypes)
+            {
+                case 5: // 4 keys
+                {
+                    var key3Type = multiKeyAttribute.AttributeClass.TypeArguments[2].Name;
+                    var selector3 = (string)multiKeyAttribute.ConstructorArguments[2].Value!;
+                    var key4Type = multiKeyAttribute.AttributeClass.TypeArguments[3].Name;
+                    var selector4 = (string)multiKeyAttribute.ConstructorArguments[3].Value!;
+                    itemType = multiKeyAttribute.AttributeClass.TypeArguments[4].Name;
+                    s = Template4(key1Type, key2Type, key3Type, key4Type, itemType, selector1, selector2, selector3, selector4, dictName)
+                        .SplitLines()
+                        .Select(o => new StringBuilder(o));
+                    break;
+                }
+                case 4: // 3 keys
+                {
+                    var key3Type = multiKeyAttribute.AttributeClass.TypeArguments[2].Name;
+                    var selector3 = (string)multiKeyAttribute.ConstructorArguments[2].Value!;
+                    itemType = multiKeyAttribute.AttributeClass.TypeArguments[3].Name;
+                    s = Template3(key1Type, key2Type, key3Type, itemType, selector1, selector2, selector3, dictName)
+                        .SplitLines()
+                        .Select(o => new StringBuilder(o));
+                    break;
+                }
+                default: // 2 keys
+                    itemType = multiKeyAttribute.AttributeClass.TypeArguments[2].Name;
+                    s = Template2(key1Type, key2Type, itemType, selector1, selector2, dictName)
+                        .SplitLines()
+                        .Select(o => new StringBuilder(o));
+                    break;
+            }
+
+            foreach (var (_, parentDeclaration) in parents)
+            {
+                s = SyntaxNodeHelper.IndentAndWrap(s, parentDeclaration, "}");
+            }
+            s = SyntaxNodeHelper.Wrap(s, $"namespace {nameSpace};\n");
+            s = SyntaxNodeHelper.Wrap(s,"#if MULTIKEY_USE_NEWTONSOFT_JSON\nusing NJson = Newtonsoft.Json;\n#endif\n#if MULTIKEY_USE_SYSTEM_JSON\nusing System.Text.Json;\nusing SJson = System.Text.Json.Serialization;\n#endif\n");
+            s = SyntaxNodeHelper.Wrap(s, 
+                                    namespaces
+                                            .OrderBy(ns => ns)
+                                            .Aggregate(
+                                                    new StringBuilder(), 
+                                                    (acc, next) => acc.AppendLine($"using {next};")).ToString());
+            
+            s = SyntaxNodeHelper.Wrap(s, Header, Footer(dictName, itemType, parents.Select(parent => parent.name).ToList()));
+            
+            var content = s.Aggregate(new StringBuilder(), (acc, next) => acc.AppendLine(next.ToString())).ToString();
+            
+            yield return (fileName: $"{nameSpace.Replace(".", "_")}_{string.Join("-", parents.Select(p => p.name).Aggregate(new Stack<string>(), (acc, next) => { acc.Push(next); return acc; }).Concat(new[] { dictName })).Replace(".", "_")}", content);
         }
     }
+
+    private const string Header = """
+                                  // <auto-generated>
+                                  // This code was generated by a tool.
+                                  // Changes to this file may cause incorrect behavior 
+                                  // and will be lost if the code is regenerated.
+                                  // </auto-generated>
+
+                                  /*
+                                      To enable System.Text.Json, define the constant in your project: 
+                                      MULTIKEY_USE_SYSTEM_JSON
+                                      
+                                      To enable Newtonsoft.Json, define the constant in your project: 
+                                      MULTIKEY_USE_NEWTONSOFT_JSON
+                                  */
+                                  
+                                  #nullable enable
+                                  """;
+
+    private static string Footer(string dictName, string itemType, List<string> wrappers) => $$"""
+          
+          public static class {{string.Join(string.Empty, wrappers)}}{{dictName}}Extensions
+          {
+              public static {{string.Join(".", wrappers)}}{{(wrappers.Any() ? "." : string.Empty)}}{{dictName}} To{{string.Join(string.Empty, wrappers)}}{{dictName}}(this IEnumerable<{{itemType}}> sequence)
+              {
+                  return new(sequence);
+              }
+          }
+          
+          #nullable restore
+          """;
+    
+    private static string Template2(string key1Type,
+        string key2Type,
+        string itemType,
+        string selector1,
+        string selector2,
+        string dictName) =>
+        $$"""
+          /// <summary>
+          /// Represents a specialized immutable dictionary of {{itemType}}.
+          /// </summary>
+          /// <remarks>
+          /// The <see cref="{{dictName}}"/> class provides efficient lookup capabilities 
+          /// for items using both primary and secondary keys. The primary key allows for direct access to individual items,
+          /// while the secondary key allows for grouped access to items sharing the same secondary key.
+          /// </remarks>
+          /// <example>
+          /// The following example demonstrates how to use the <see cref="{{dictName}}"/>:
+          /// <code>
+          /// {{dictName}} dictionary = new {{dictName}}();
+          /// {{key1Type}} primaryKey = /* any {{key1Type}} value */ default;
+          /// {{key2Type}} secondaryKey = /* any {{key2Type}} value */ default;
+          /// {{itemType}} byPrimary = dictionary[primaryKey]; // Returns 1 item or throws exception
+          /// IReadOnlyList<{{itemType}}> bySecondary = dictionary.Get2(secondaryKey); // Returns 0+ items
+          /// </code>
+          /// </example>
+          #if MULTIKEY_USE_NEWTONSOFT_JSON
+          [NJson.JsonConverter(typeof({{dictName}}NewtonsoftConverter))]
+          #endif
+          #if MULTIKEY_USE_SYSTEM_JSON
+          [SJson.JsonConverter(typeof({{dictName}}SystemConverter))]
+          #endif
+          public sealed partial record {{dictName}} : 
+                IReadOnlyDictionary<{{key1Type}}, {{itemType}}>, 
+                IEnumerable<KeyValuePair<{{key1Type}}, {{itemType}}>>
+          {
+             private readonly ImmutableList<{{itemType}}> _items;
+          
+             private ImmutableDictionary<{{key1Type}}, int>? _index1; // Will be initialized lazily
+          
+             private ImmutableDictionary<{{key2Type}}, ImmutableHashSet<int>>? _index2; // Will be initialized lazily
+          
+             static {{dictName}}()
+             {
+                 // These two assignments will be filled in by source generation, supplied by user
+                 Selector1 = (Func<{{itemType}}, {{key1Type}}>)({{selector1}});
+                 Selector2 = (Func<{{itemType}}, {{key2Type}}>)({{selector2}});
+             }
+          
+             private static readonly Func<{{itemType}}, {{key1Type}}> Selector1;
+          
+             private static readonly Func<{{itemType}}, {{key2Type}}> Selector2;
+          
+             private ImmutableDictionary<{{key1Type}}, int> Index1 =>
+                 _index1 ??= _items
+                     .Select((item, index) => (item, index))
+                     .Where(i => i.item is not null)
+                     .ToImmutableDictionary(key => Selector1(key.item!), value => value.index);
+          
+             private ImmutableDictionary<{{key2Type}}, ImmutableHashSet<int>> Index2 =>
+                 _index2 ??= _items
+                     .Select((item, index) => (item, index))
+                     .Where(i => i.item != null)
+                     .GroupBy(item => Selector2(item.item!))
+                     .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
+          
+             public {{dictName}}()
+             {
+                 _items = new List<{{itemType}}>().ToImmutableList();
+             }
+          
+             public {{dictName}}(IEnumerable<{{itemType}}> items)
+             {
+                 _items = items.ToImmutableList();
+             }
+          
+             public {{itemType}} this[{{key1Type}} primary] => _items[Index1[primary]];
+          
+             public IEnumerable<{{key1Type}}> Keys => Index1.Keys;
+             public IEnumerable<{{key2Type}}> Keys2 => Index2.Keys;
+             public IEnumerable<{{itemType}}> Values => _items;
+          
+             public bool ContainsKey({{key1Type}} key) =>
+                 Index1.ContainsKey(key);
+          
+             public bool ContainsKey2({{key2Type}} key) =>
+                 Index2.ContainsKey(key);
+          
+             public bool TryGetValue({{key1Type}} primaryKey, out {{itemType}} item)
+             {
+                 if (Index1.TryGetValue(primaryKey, out var index))
+                 {
+                     item = _items[index];
+                     return true;
+                 }
+          
+                 item = default!;
+                 return false;
+             }
+          
+             public bool TryGetValue2({{key2Type}} secondaryKey, out IReadOnlyList<{{itemType}}> items)
+             {
+                 if (Index2.TryGetValue(secondaryKey, out var indexes))
+                 {
+                     items = indexes.Select(i => _items[i]).ToList().AsReadOnly();
+                     return true;
+                 }
+          
+                 items = default!;
+                 return false;
+             }
+             
+             public {{itemType}} Get({{key1Type}} primaryKey)
+             {
+                return this[primaryKey];
+             }
+             
+             public IReadOnlyList<{{itemType}}> Get2({{key2Type}} secondaryKey)
+             {
+                return Index2.TryGetValue(secondaryKey, out var result)
+                    ? result.Select(index => _items[index]).ToList().AsReadOnly()
+                    : Enumerable.Empty<{{itemType}}>().ToList().AsReadOnly();
+             }
+          
+             public {{dictName}} Add({{itemType}} item)
+             {
+                 var primaryKey = Selector1(item);
+          
+                 if (Index1.ContainsKey(primaryKey))
+                     throw new ArgumentException("An item with the same primary key already exists in the dictionary.",
+                         nameof(_index1));
+          
+                 return new(_items.Add(item));
+             }
+          
+             public {{dictName}} Remove({{key1Type}} primary)
+             {
+                 if (!Index1.TryGetValue(primary, out var index))
+                     return this;
+          
+                 return new(_items.Remove(_items[index]));
+             }
+          
+             public {{dictName}} Remove({{itemType}} item) =>
+                 new(_items.Remove(item));
+          
+             public {{dictName}} SetItem({{itemType}} item)
+             {
+                 var primaryKey = Selector1(item);
+          
+                 if (!Index1.TryGetValue(primaryKey, out var index))
+                 {
+                     return Add(item);
+                 }
+          
+                 return new(_items.SetItem(index, item));
+             }
+          
+             public {{dictName}} Compact() =>
+                 new(_items.Where(item => item is not null));
+
+          #if MULTIKEY_USE_NEWTONSOFT_JSON
+          public class {{dictName}}NewtonsoftConverter : NJson.JsonConverter
+          {
+             public override bool CanConvert(Type objectType) => objectType == typeof({{dictName}});
+          
+             public override void WriteJson(NJson.JsonWriter writer, object? value, NJson.JsonSerializer serializer)
+             {
+                 var dictionary = value as {{dictName}};
+                 if (dictionary is null)
+                 {
+                     writer.WriteNull();
+                     return;
+                 }
+          
+                 serializer.Serialize(writer, dictionary.Values);
+             }
+          
+             public override object ReadJson(NJson.JsonReader reader, Type objectType, object? existingValue, NJson.JsonSerializer serializer)
+             {
+                 if (reader.TokenType == NJson.JsonToken.Null)
+                     return null!;
+          
+                 var items = serializer.Deserialize<List<{{itemType}}>>(reader);
+                 if (items is null)
+                     return null!;
+          
+                 return new {{dictName}}(items);
+             }
+          }
+          #endif
+          
+          #if MULTIKEY_USE_SYSTEM_JSON
+             public class {{dictName}}SystemConverter : SJson.JsonConverter<{{dictName}}>
+             {
+                 public override {{dictName}} Read(ref Utf8JsonReader reader, Type typeToConvert,
+                     JsonSerializerOptions options)
+                 {
+                     if (reader.TokenType != JsonTokenType.StartArray)
+                     {
+                         throw new JsonException("Invalid {{dictName}} serialization");
+                     }
+          
+                     List<{{itemType}}> primary = new();
+          
+                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                     {
+                         var item = JsonSerializer.Deserialize<{{itemType}}>(ref reader, options);
+                         primary.Add(item!);
+                     }
+          
+                     return new {{dictName}}(primary);
+                 }
+          
+                 public override void Write(Utf8JsonWriter writer, {{dictName}} value, JsonSerializerOptions options)
+                 {
+                     writer.WriteStartArray();
+          
+                     foreach (var item in value.Values)
+                     {
+                         JsonSerializer.Serialize(writer, item, options);
+                     }
+          
+                     writer.WriteEndArray();
+                 }
+             }
+          #endif
+          
+             public int Count => Index1.Count;
+          
+             IEnumerator<KeyValuePair<{{key1Type}}, {{itemType}}>> IEnumerable<KeyValuePair<{{key1Type}}, {{itemType}}>>.GetEnumerator()
+             {
+                 return Index1
+                     .Select(kvp => new KeyValuePair<{{key1Type}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
+                     .GetEnumerator();
+             }
+          
+             public IEnumerator GetEnumerator()
+             {
+                  return Index1
+                      .Select(kvp => new KeyValuePair<{{key1Type}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
+                      .GetEnumerator();
+             }
+          }
+          """;
+    
+    private static string Template3(string key1Type,
+        string key2Type,
+        string key3Type,
+        string itemType,
+        string selector1,
+        string selector2,
+        string selector3,
+        string dictName) =>
+        $$"""
+          /// <summary>
+          /// Represents a specialized immutable dictionary of {{itemType}}.
+          /// </summary>
+          /// <remarks>
+          /// The <see cref="{{dictName}}"/> class provides efficient lookup capabilities 
+          /// for items using both primary and secondary keys. The primary key allows for direct access to individual items,
+          /// while the secondary key allows for grouped access to items sharing the same secondary key.
+          /// </remarks>
+          /// <example>
+          /// The following example demonstrates how to use the <see cref="{{dictName}}"/>:
+          /// <code>
+          /// {{dictName}} dictionary = new {{dictName}}();
+          /// {{key1Type}} primaryKey = /* any {{key1Type}} value */ default;
+          /// {{key2Type}} secondaryKey = /* any {{key2Type}} value */ default;
+          /// {{key3Type}} tertiaryKey = /* any {{key3Type}} value */ default;
+          /// {{itemType}} byPrimary = dictionary[primaryKey]; // Returns 1 item or throws exception
+          /// IReadOnlyList<{{itemType}}> bySecondary = dictionary.Get2(secondaryKey); // Returns 0+ items
+          /// IReadOnlyList<{{itemType}}> byTertiary = dictionary.Get3(tertiaryKey); // Returns 0+ items
+          /// </code>
+          /// </example>
+          #if MULTIKEY_USE_NEWTONSOFT_JSON
+          [NJson.JsonConverter(typeof({{dictName}}NewtonsoftConverter))]
+          #endif
+          #if MULTIKEY_USE_SYSTEM_JSON
+          [SJson.JsonConverter(typeof({{dictName}}SystemConverter))]
+          #endif
+          public sealed partial record {{dictName}} : 
+                IReadOnlyDictionary<{{key1Type}}, {{itemType}}>, 
+                IEnumerable<KeyValuePair<{{key1Type}}, {{itemType}}>>
+          {
+             private readonly ImmutableList<{{itemType}}> _items;
+          
+             private ImmutableDictionary<{{key1Type}}, int>? _index1; // Will be initialized lazily
+          
+             private ImmutableDictionary<{{key2Type}}, ImmutableHashSet<int>>? _index2; // Will be initialized lazily
+          
+             private ImmutableDictionary<{{key3Type}}, ImmutableHashSet<int>>? _index3; // Will be initialized lazily
+             
+             static {{dictName}}()
+             {
+                 // These two assignments will be filled in by source generation, supplied by user
+                 Selector1 = (Func<{{itemType}}, {{key1Type}}>)({{selector1}});
+                 Selector2 = (Func<{{itemType}}, {{key2Type}}>)({{selector2}});
+                 Selector3 = (Func<{{itemType}}, {{key3Type}}>)({{selector3}});
+             }
+          
+             private static readonly Func<{{itemType}}, {{key1Type}}> Selector1;
+          
+             private static readonly Func<{{itemType}}, {{key2Type}}> Selector2;
+          
+             private static readonly Func<{{itemType}}, {{key3Type}}> Selector3;
+             
+             private ImmutableDictionary<{{key1Type}}, int> Index1 =>
+                 _index1 ??= _items
+                     .Select((item, index) => (item, index))
+                     .Where(i => i.item is not null)
+                     .ToImmutableDictionary(key => Selector1(key.item!), value => value.index);
+          
+             private ImmutableDictionary<{{key2Type}}, ImmutableHashSet<int>> Index2 =>
+                 _index2 ??= _items
+                     .Select((item, index) => (item, index))
+                     .Where(i => i.item != null)
+                     .GroupBy(item => Selector2(item.item!))
+                     .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
+             
+             private ImmutableDictionary<{{key3Type}}, ImmutableHashSet<int>> Index3 =>
+                _index3 ??= _items
+                      .Select((item, index) => (item, index))
+                      .Where(i => i.item != null)
+                      .GroupBy(item => Selector3(item.item!))
+                      .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
+             
+             public {{dictName}}()
+             {
+                 _items = new List<{{itemType}}>().ToImmutableList();
+             }
+          
+             public {{dictName}}(IEnumerable<{{itemType}}> items)
+             {
+                 _items = items.ToImmutableList();
+             }
+          
+             public {{itemType}} this[{{key1Type}} primary] => _items[Index1[primary]];
+          
+             public IEnumerable<{{key1Type}}> Keys => Index1.Keys;
+             public IEnumerable<{{key2Type}}> Keys2 => Index2.Keys;
+             public IEnumerable<{{key3Type}}> Keys3 => Index3.Keys;
+             public IEnumerable<{{itemType}}> Values => _items;
+          
+             public bool ContainsKey({{key1Type}} key) =>
+                 Index1.ContainsKey(key);
+          
+             public bool ContainsKey2({{key2Type}} key) =>
+                 Index2.ContainsKey(key);
+                 
+             public bool ContainsKey3({{key3Type}} key) =>
+                 Index3.ContainsKey(key);
+          
+             public bool TryGetValue({{key1Type}} primaryKey, out {{itemType}} item)
+             {
+                 if (Index1.TryGetValue(primaryKey, out var index))
+                 {
+                     item = _items[index];
+                     return true;
+                 }
+          
+                 item = default!;
+                 return false;
+             }
+          
+             public bool TryGetValue2({{key2Type}} secondaryKey, out IReadOnlyList<{{itemType}}> items)
+             {
+                 if (Index2.TryGetValue(secondaryKey, out var indexes))
+                 {
+                     items = indexes.Select(i => _items[i]).ToList().AsReadOnly();
+                     return true;
+                 }
+          
+                 items = default!;
+                 return false;
+             }
+             
+             public bool TryGetValue3({{key3Type}} tertiaryKey, out IReadOnlyList<{{itemType}}> items)
+             {
+                 if (Index3.TryGetValue(tertiaryKey, out var indexes))
+                 {
+                     items = indexes.Select(i => _items[i]).ToList().AsReadOnly();
+                     return true;
+                 }
+             
+                 items = default!;
+                 return false;
+             }
+             
+             public {{itemType}} Get({{key1Type}} primaryKey)
+             {
+                return this[primaryKey];
+             }
+             
+             public IReadOnlyList<{{itemType}}> Get2({{key2Type}} secondaryKey)
+             {
+                return Index2.TryGetValue(secondaryKey, out var result)
+                    ? result.Select(index => _items[index]).ToList().AsReadOnly()
+                    : Enumerable.Empty<{{itemType}}>().ToList().AsReadOnly();
+             }
+             
+             public IReadOnlyList<{{itemType}}> Get3({{key3Type}} tertiaryKey)
+             {
+                return Index3.TryGetValue(tertiaryKey, out var result)
+                    ? result.Select(index => _items[index]).ToList().AsReadOnly()
+                    : Enumerable.Empty<{{itemType}}>().ToList().AsReadOnly();
+             }
+          
+             public {{dictName}} Add({{itemType}} item)
+             {
+                 var primaryKey = Selector1(item);
+          
+                 if (Index1.ContainsKey(primaryKey))
+                     throw new ArgumentException("An item with the same primary key already exists in the dictionary.",
+                         nameof(_index1));
+          
+                 return new(_items.Add(item));
+             }
+          
+             public {{dictName}} Remove({{key1Type}} primary)
+             {
+                 if (!Index1.TryGetValue(primary, out var index))
+                     return this;
+          
+                 return new(_items.Remove(_items[index]));
+             }
+          
+             public {{dictName}} Remove({{itemType}} item) =>
+                 new(_items.Remove(item));
+          
+             public {{dictName}} SetItem({{itemType}} item)
+             {
+                 var primaryKey = Selector1(item);
+          
+                 if (!Index1.TryGetValue(primaryKey, out var index))
+                 {
+                     return Add(item);
+                 }
+          
+                 return new(_items.SetItem(index, item));
+             }
+          
+             public {{dictName}} Compact() =>
+                 new(_items.Where(item => item is not null));
+
+          #if MULTIKEY_USE_NEWTONSOFT_JSON
+          public class {{dictName}}NewtonsoftConverter : NJson.JsonConverter
+          {
+             public override bool CanConvert(Type objectType) => objectType == typeof({{dictName}});
+          
+             public override void WriteJson(NJson.JsonWriter writer, object? value, NJson.JsonSerializer serializer)
+             {
+                 var dictionary = value as {{dictName}};
+                 if (dictionary is null)
+                 {
+                     writer.WriteNull();
+                     return;
+                 }
+          
+                 serializer.Serialize(writer, dictionary.Values);
+             }
+          
+             public override object ReadJson(NJson.JsonReader reader, Type objectType, object? existingValue, NJson.JsonSerializer serializer)
+             {
+                 if (reader.TokenType == NJson.JsonToken.Null)
+                     return null!;
+          
+                 var items = serializer.Deserialize<List<{{itemType}}>>(reader);
+                 if (items is null)
+                     return null!;
+          
+                 return new {{dictName}}(items);
+             }
+          }
+          #endif
+          
+          #if MULTIKEY_USE_SYSTEM_JSON
+             public class {{dictName}}SystemConverter : SJson.JsonConverter<{{dictName}}>
+             {
+                 public override {{dictName}} Read(ref Utf8JsonReader reader, Type typeToConvert,
+                     JsonSerializerOptions options)
+                 {
+                     if (reader.TokenType != JsonTokenType.StartArray)
+                     {
+                         throw new JsonException("Invalid {{dictName}} serialization");
+                     }
+          
+                     List<{{itemType}}> primary = new();
+          
+                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                     {
+                         var item = JsonSerializer.Deserialize<{{itemType}}>(ref reader, options);
+                         primary.Add(item!);
+                     }
+          
+                     return new {{dictName}}(primary);
+                 }
+          
+                 public override void Write(Utf8JsonWriter writer, {{dictName}} value, JsonSerializerOptions options)
+                 {
+                     writer.WriteStartArray();
+          
+                     foreach (var item in value.Values)
+                     {
+                         JsonSerializer.Serialize(writer, item, options);
+                     }
+          
+                     writer.WriteEndArray();
+                 }
+             }
+          #endif
+          
+             public int Count => Index1.Count;
+          
+             IEnumerator<KeyValuePair<{{key1Type}}, {{itemType}}>> IEnumerable<KeyValuePair<{{key1Type}}, {{itemType}}>>.GetEnumerator()
+             {
+                 return Index1
+                     .Select(kvp => new KeyValuePair<{{key1Type}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
+                     .GetEnumerator();
+             }
+          
+             public IEnumerator GetEnumerator()
+             {
+                  return Index1
+                      .Select(kvp => new KeyValuePair<{{key1Type}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
+                      .GetEnumerator();
+             }
+          }
+          """;
+    
+private static string Template4(string key1Type,
+        string key2Type,
+        string key3Type,
+        string key4Type,
+        string itemType,
+        string selector1,
+        string selector2,
+        string selector3,
+        string selector4,
+        string dictName) =>
+        $$"""
+          /// <summary>
+          /// Represents a specialized immutable dictionary of {{itemType}}.
+          /// </summary>
+          /// <remarks>
+          /// The <see cref="{{dictName}}"/> class provides efficient lookup capabilities 
+          /// for items using both primary and secondary keys. The primary key allows for direct access to individual items,
+          /// while the secondary key allows for grouped access to items sharing the same secondary key.
+          /// </remarks>
+          /// <example>
+          /// The following example demonstrates how to use the <see cref="{{dictName}}"/>:
+          /// <code>
+          /// {{dictName}} dictionary = new {{dictName}}();
+          /// {{key1Type}} primaryKey = /* any {{key1Type}} value */ default;
+          /// {{key2Type}} secondaryKey = /* any {{key2Type}} value */ default;
+          /// {{key3Type}} tertiaryKey = /* any {{key3Type}} value */ default;
+          /// {{key4Type}} quaternaryKey = /* any {{key4Type}} value */ default;
+          /// {{itemType}} byPrimary = dictionary[primaryKey]; // Returns 1 item or throws exception
+          /// IReadOnlyList<{{itemType}}> bySecondary = dictionary.Get2(secondaryKey); // Returns 0+ items
+          /// IReadOnlyList<{{itemType}}> byTertiary = dictionary.Get3(tertiaryKey); // Returns 0+ items
+          /// IReadOnlyList<{{itemType}}> byQuaternary = dictionary.Get4(quaternaryKey); // Returns 0+ items
+          /// </code>
+          /// </example>
+          #if MULTIKEY_USE_NEWTONSOFT_JSON
+          [NJson.JsonConverter(typeof({{dictName}}NewtonsoftConverter))]
+          #endif
+          #if MULTIKEY_USE_SYSTEM_JSON
+          [SJson.JsonConverter(typeof({{dictName}}SystemConverter))]
+          #endif
+          public sealed partial record {{dictName}} : 
+                IReadOnlyDictionary<{{key1Type}}, {{itemType}}>, 
+                IEnumerable<KeyValuePair<{{key1Type}}, {{itemType}}>>
+          {
+             private readonly ImmutableList<{{itemType}}> _items;
+          
+             private ImmutableDictionary<{{key1Type}}, int>? _index1; // Will be initialized lazily
+          
+             private ImmutableDictionary<{{key2Type}}, ImmutableHashSet<int>>? _index2; // Will be initialized lazily
+          
+             private ImmutableDictionary<{{key3Type}}, ImmutableHashSet<int>>? _index3; // Will be initialized lazily
+             
+             private ImmutableDictionary<{{key4Type}}, ImmutableHashSet<int>>? _index4; // Will be initialized lazily
+          
+             static {{dictName}}()
+             {
+                 // These two assignments will be filled in by source generation, supplied by user
+                 Selector1 = (Func<{{itemType}}, {{key1Type}}>)({{selector1}});
+                 Selector2 = (Func<{{itemType}}, {{key2Type}}>)({{selector2}});
+                 Selector3 = (Func<{{itemType}}, {{key3Type}}>)({{selector3}});
+                 Selector4 = (Func<{{itemType}}, {{key3Type}}>)({{selector4}});
+             }
+          
+             private static readonly Func<{{itemType}}, {{key1Type}}> Selector1;
+          
+             private static readonly Func<{{itemType}}, {{key2Type}}> Selector2;
+          
+             private static readonly Func<{{itemType}}, {{key3Type}}> Selector3;
+             
+             private static readonly Func<{{itemType}}, {{key4Type}}> Selector4;
+             
+             private ImmutableDictionary<{{key1Type}}, int> Index1 =>
+                 _index1 ??= _items
+                     .Select((item, index) => (item, index))
+                     .Where(i => i.item is not null)
+                     .ToImmutableDictionary(key => Selector1(key.item!), value => value.index);
+          
+             private ImmutableDictionary<{{key2Type}}, ImmutableHashSet<int>> Index2 =>
+                 _index2 ??= _items
+                     .Select((item, index) => (item, index))
+                     .Where(i => i.item != null)
+                     .GroupBy(item => Selector2(item.item!))
+                     .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
+             
+             private ImmutableDictionary<{{key3Type}}, ImmutableHashSet<int>> Index3 =>
+                _index3 ??= _items
+                      .Select((item, index) => (item, index))
+                      .Where(i => i.item != null)
+                      .GroupBy(item => Selector3(item.item!))
+                      .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
+             
+             private ImmutableDictionary<{{key3Type}}, ImmutableHashSet<int>> Index4 =>
+                _index4 ??= _items
+                       .Select((item, index) => (item, index))
+                       .Where(i => i.item != null)
+                       .GroupBy(item => Selector4(item.item!))
+                       .ToImmutableDictionary(group => group.Key, group => group.Select(x => x.index).ToImmutableHashSet());
+             
+             public {{dictName}}()
+             {
+                 _items = new List<{{itemType}}>().ToImmutableList();
+             }
+          
+             public {{dictName}}(IEnumerable<{{itemType}}> items)
+             {
+                 _items = items.ToImmutableList();
+             }
+          
+             public {{itemType}} this[{{key1Type}} primary] => _items[Index1[primary]];
+          
+             public IEnumerable<{{key1Type}}> Keys => Index1.Keys;
+             public IEnumerable<{{key2Type}}> Keys2 => Index2.Keys;
+             public IEnumerable<{{key3Type}}> Keys3 => Index3.Keys;
+             public IEnumerable<{{key4Type}}> Keys4 => Index4.Keys;
+             public IEnumerable<{{itemType}}> Values => _items;
+          
+             public bool ContainsKey({{key1Type}} key) =>
+                 Index1.ContainsKey(key);
+          
+             public bool ContainsKey2({{key2Type}} key) =>
+                 Index2.ContainsKey(key);
+                 
+             public bool ContainsKey3({{key3Type}} key) =>
+                 Index3.ContainsKey(key);
+                 
+             public bool ContainsKey4({{key4Type}} key) =>
+                 Index4.ContainsKey(key);
+          
+             public bool TryGetValue({{key1Type}} primaryKey, out {{itemType}} item)
+             {
+                 if (Index1.TryGetValue(primaryKey, out var index))
+                 {
+                     item = _items[index];
+                     return true;
+                 }
+          
+                 item = default!;
+                 return false;
+             }
+          
+             public bool TryGetValue2({{key2Type}} secondaryKey, out IReadOnlyList<{{itemType}}> items)
+             {
+                 if (Index2.TryGetValue(secondaryKey, out var indexes))
+                 {
+                     items = indexes.Select(i => _items[i]).ToList().AsReadOnly();
+                     return true;
+                 }
+          
+                 items = default!;
+                 return false;
+             }
+             
+             public bool TryGetValue3({{key3Type}} tertiaryKey, out IReadOnlyList<{{itemType}}> items)
+             {
+                 if (Index3.TryGetValue(tertiaryKey, out var indexes))
+                 {
+                     items = indexes.Select(i => _items[i]).ToList().AsReadOnly();
+                     return true;
+                 }
+             
+                 items = default!;
+                 return false;
+             }
+             
+             public bool TryGetValue4({{key4Type}} quaternaryKey, out IReadOnlyList<{{itemType}}> items)
+             {
+                 if (Index4.TryGetValue(quaternaryKey, out var indexes))
+                 {
+                     items = indexes.Select(i => _items[i]).ToList().AsReadOnly();
+                     return true;
+                 }
+             
+                 items = default!;
+                 return false;
+             }
+             
+             public {{itemType}} Get({{key1Type}} primaryKey)
+             {
+                return this[primaryKey];
+             }
+             
+             public IReadOnlyList<{{itemType}}> Get2({{key2Type}} secondaryKey)
+             {
+                return Index2.TryGetValue(secondaryKey, out var result)
+                    ? result.Select(index => _items[index]).ToList().AsReadOnly()
+                    : Enumerable.Empty<{{itemType}}>().ToList().AsReadOnly();
+             }
+             
+             public IReadOnlyList<{{itemType}}> Get3({{key3Type}} tertiaryKey)
+             {
+                return Index3.TryGetValue(tertiaryKey, out var result)
+                    ? result.Select(index => _items[index]).ToList().AsReadOnly()
+                    : Enumerable.Empty<{{itemType}}>().ToList().AsReadOnly();
+             }
+             
+             public IReadOnlyList<{{itemType}}> Get4({{key4Type}} quaternaryKey)
+             {
+                return Index4.TryGetValue(quaternaryKey, out var result)
+                    ? result.Select(index => _items[index]).ToList().AsReadOnly()
+                    : Enumerable.Empty<{{itemType}}>().ToList().AsReadOnly();
+             }
+          
+             public {{dictName}} Add({{itemType}} item)
+             {
+                 var primaryKey = Selector1(item);
+          
+                 if (Index1.ContainsKey(primaryKey))
+                     throw new ArgumentException("An item with the same primary key already exists in the dictionary.",
+                         nameof(_index1));
+          
+                 return new(_items.Add(item));
+             }
+          
+             public {{dictName}} Remove({{key1Type}} primary)
+             {
+                 if (!Index1.TryGetValue(primary, out var index))
+                     return this;
+          
+                 return new(_items.Remove(_items[index]));
+             }
+          
+             public {{dictName}} Remove({{itemType}} item) =>
+                 new(_items.Remove(item));
+          
+             public {{dictName}} SetItem({{itemType}} item)
+             {
+                 var primaryKey = Selector1(item);
+          
+                 if (!Index1.TryGetValue(primaryKey, out var index))
+                 {
+                     return Add(item);
+                 }
+          
+                 return new(_items.SetItem(index, item));
+             }
+          
+             public {{dictName}} Compact() =>
+                 new(_items.Where(item => item is not null));
+
+          #if MULTIKEY_USE_NEWTONSOFT_JSON
+          public class {{dictName}}NewtonsoftConverter : NJson.JsonConverter
+          {
+             public override bool CanConvert(Type objectType) => objectType == typeof({{dictName}});
+          
+             public override void WriteJson(NJson.JsonWriter writer, object? value, NJson.JsonSerializer serializer)
+             {
+                 var dictionary = value as {{dictName}};
+                 if (dictionary is null)
+                 {
+                     writer.WriteNull();
+                     return;
+                 }
+          
+                 serializer.Serialize(writer, dictionary.Values);
+             }
+          
+             public override object ReadJson(NJson.JsonReader reader, Type objectType, object? existingValue, NJson.JsonSerializer serializer)
+             {
+                 if (reader.TokenType == NJson.JsonToken.Null)
+                     return null!;
+          
+                 var items = serializer.Deserialize<List<{{itemType}}>>(reader);
+                 if (items is null)
+                     return null!;
+          
+                 return new {{dictName}}(items);
+             }
+          }
+          #endif
+          
+          #if MULTIKEY_USE_SYSTEM_JSON
+             public class {{dictName}}SystemConverter : SJson.JsonConverter<{{dictName}}>
+             {
+                 public override {{dictName}} Read(ref Utf8JsonReader reader, Type typeToConvert,
+                     JsonSerializerOptions options)
+                 {
+                     if (reader.TokenType != JsonTokenType.StartArray)
+                     {
+                         throw new JsonException("Invalid {{dictName}} serialization");
+                     }
+          
+                     List<{{itemType}}> primary = new();
+          
+                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                     {
+                         var item = JsonSerializer.Deserialize<{{itemType}}>(ref reader, options);
+                         primary.Add(item!);
+                     }
+          
+                     return new {{dictName}}(primary);
+                 }
+          
+                 public override void Write(Utf8JsonWriter writer, {{dictName}} value, JsonSerializerOptions options)
+                 {
+                     writer.WriteStartArray();
+          
+                     foreach (var item in value.Values)
+                     {
+                         JsonSerializer.Serialize(writer, item, options);
+                     }
+          
+                     writer.WriteEndArray();
+                 }
+             }
+          #endif
+          
+             public int Count => Index1.Count;
+          
+             IEnumerator<KeyValuePair<{{key1Type}}, {{itemType}}>> IEnumerable<KeyValuePair<{{key1Type}}, {{itemType}}>>.GetEnumerator()
+             {
+                 return Index1
+                     .Select(kvp => new KeyValuePair<{{key1Type}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
+                     .GetEnumerator();
+             }
+          
+             public IEnumerator GetEnumerator()
+             {
+                  return Index1
+                      .Select(kvp => new KeyValuePair<{{key1Type}}, {{itemType}}>(kvp.Key, _items[kvp.Value]!))
+                      .GetEnumerator();
+             }
+          }
+          """;
 }
 
-public static class NamespaceCollector
+public static class SyntaxNodeHelper
 {
-    public static (string Namespace, HashSet<string> Namespaces, List<string> EnclosingDeclarations) CollectNamespacesAndEnclosingDeclarations(SyntaxNode node, SemanticModel semanticModel)
+    public static string GetNamespace(BaseTypeDeclarationSyntax syntax, CancellationToken cancellationToken)
     {
-        var namespaces = new HashSet<string>();
-        var enclosingDeclarations = new List<string>();
-        string outerNamespace = string.Empty;
+        StringBuilder nameSpace = default!;
 
-        // Collect namespaces
-        var symbols = node.DescendantNodes()
-                          .OfType<IdentifierNameSyntax>()
-                          .Select(identifier => ModelExtensions.GetSymbolInfo(semanticModel, identifier).Symbol)
-                          .Where(symbol => symbol is not null)
-                          .Distinct(SymbolEqualityComparer.Default);
+        SyntaxNode? potentialNamespaceParent = syntax.Parent;
 
-        foreach (var symbol in symbols)
+        while (potentialNamespaceParent != null &&
+                potentialNamespaceParent is not NamespaceDeclarationSyntax
+                && potentialNamespaceParent is not FileScopedNamespaceDeclarationSyntax
+                && !cancellationToken.IsCancellationRequested)
         {
-            if (symbol!.ContainingNamespace != null && !symbol.ContainingNamespace.IsGlobalNamespace)
-            {
-                namespaces.Add(symbol.ContainingNamespace.ToDisplayString());
-            }
+            potentialNamespaceParent = potentialNamespaceParent.Parent;
         }
 
-        // Collect enclosing declarations and the namespace
-        var current = node;
-        while (current != null)
+        if (potentialNamespaceParent is BaseNamespaceDeclarationSyntax namespaceParent)
         {
-            if (current is NamespaceDeclarationSyntax namespaceDeclaration)
-            {
-                if (string.IsNullOrEmpty(outerNamespace))
-                {
-                    outerNamespace = namespaceDeclaration.Name.ToString();
-                }
-            }
-            else if (current is FileScopedNamespaceDeclarationSyntax fileScopedNamespaceDeclaration)
-            {
-                if (string.IsNullOrEmpty(outerNamespace))
-                {
-                    outerNamespace = fileScopedNamespaceDeclaration.Name.ToString();
-                }
-            }
-            else if (current is ClassDeclarationSyntax classDeclaration)
-            {
-                var modifiers = string.Join(" ", classDeclaration.Modifiers.Select(m => m.Text));
-                enclosingDeclarations.Add($"{modifiers} class {classDeclaration.Identifier}");
-            }
-            else if (current is StructDeclarationSyntax structDeclaration)
-            {
-                var modifiers = string.Join(" ", structDeclaration.Modifiers.Select(m => m.Text));
-                enclosingDeclarations.Add($"{modifiers} struct {structDeclaration.Identifier}");
-            }
-            else if (current is RecordDeclarationSyntax recordDeclaration)
-            {
-                var modifiers = string.Join(" ", recordDeclaration.Modifiers.Select(m => m.Text));
-                enclosingDeclarations.Add($"{modifiers} record {recordDeclaration.Identifier}");
-            }
+            nameSpace = new StringBuilder(namespaceParent.Name.ToString());
 
-            current = current.Parent;
+            while (namespaceParent.Parent is NamespaceDeclarationSyntax parent && !cancellationToken.IsCancellationRequested)
+            {
+                nameSpace.Insert(0, ".");
+                nameSpace = nameSpace.Insert(0, namespaceParent.Name);
+                namespaceParent = parent;
+            }
         }
-
-        enclosingDeclarations.Reverse();
-        return (outerNamespace, namespaces, enclosingDeclarations);
+        return nameSpace.ToString();
     }
+
+    public static IEnumerable<(string name, string declaration)> GetParentClasses(BaseTypeDeclarationSyntax typeSyntax, CancellationToken cancellationToken)
+    {
+        TypeDeclarationSyntax? parentSyntax = typeSyntax.Parent as TypeDeclarationSyntax;
+
+        while (parentSyntax != null && _isAllowedKind(parentSyntax.Kind()) && !cancellationToken.IsCancellationRequested)
+        {
+            yield return (name: parentSyntax.Identifier.ToString(), declaration: $"{parentSyntax.Modifiers} {parentSyntax.Keyword} {parentSyntax.Identifier}\n{{");
+
+            parentSyntax = parentSyntax.Parent as TypeDeclarationSyntax;
+        }
+    }
+
+    private static bool _isAllowedKind(SyntaxKind kind) =>
+        kind is SyntaxKind.ClassDeclaration or SyntaxKind.StructDeclaration or SyntaxKind.RecordDeclaration;
+
+    public static IEnumerable<StringBuilder> IndentAndWrap(IEnumerable<StringBuilder> s, string preWrap, string postWrap) =>
+        Wrap(s.Select(Indent), preWrap, postWrap);
+
+    public static IEnumerable<StringBuilder> Wrap(IEnumerable<StringBuilder> s, string preWrap, string postWrap) =>
+        preWrap.SplitLines().Select(o => new StringBuilder(o)).Concat(s).Concat(postWrap.SplitLines().Select(o => new StringBuilder(o)));
+
+    public static IEnumerable<StringBuilder> Wrap(IEnumerable<StringBuilder> s, string preWrap) =>
+        preWrap.SplitLines().Select(o => new StringBuilder(o)).Concat(s);
+    
+    public static IReadOnlyList<string> SplitLines(this string lines) =>
+        lines.Split(new[] { "\n" }, StringSplitOptions.None).ToList().AsReadOnly();
+    
+    private static StringBuilder Indent(StringBuilder s) =>
+        s.Length == 0 || s[0] == '#' 
+            ? s
+            : s.Insert(0, "    ");
 }
